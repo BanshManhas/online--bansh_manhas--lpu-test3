@@ -1,0 +1,177 @@
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.stream.*;
+
+public class LogSystem {
+
+    static class LogEntry {
+        private final String timestamp;
+        private final String userId;
+        private final String action;
+
+        LogEntry(String timestamp, String userId, String action) {
+            this.timestamp = timestamp;
+            this.userId = userId;
+            this.action = action;
+        }
+
+        String getUserId() { return userId; }
+        String getAction() { return action; }
+    }
+
+    static class ActivityAggregator {
+        private final ConcurrentHashMap<String, AtomicInteger> userActivityCount = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, AtomicInteger> actionTypeCount = new ConcurrentHashMap<>();
+
+        void record(LogEntry entry) {
+            userActivityCount.computeIfAbsent(entry.getUserId(), k -> new AtomicInteger(0)).incrementAndGet();
+            actionTypeCount.computeIfAbsent(entry.getAction(), k -> new AtomicInteger(0)).incrementAndGet();
+        }
+
+        Map<String, Integer> getUserActivitySnapshot() {
+            Map<String, Integer> snapshot = new HashMap<>();
+            userActivityCount.forEach((k, v) -> snapshot.put(k, v.get()));
+            return snapshot;
+        }
+
+        Map<String, Integer> getActionTypeSnapshot() {
+            Map<String, Integer> snapshot = new HashMap<>();
+            actionTypeCount.forEach((k, v) -> snapshot.put(k, v.get()));
+            return snapshot;
+        }
+
+        String getMostActiveUser() {
+            return userActivityCount.entrySet().stream()
+                    .max(Comparator.comparingInt(e -> e.getValue().get()))
+                    .map(Map.Entry::getKey)
+                    .orElse("N/A");
+        }
+    }
+
+    static class LogProcessor implements Runnable {
+        private final Path filePath;
+        private final ActivityAggregator aggregator;
+
+        LogProcessor(Path filePath, ActivityAggregator aggregator) {
+            this.filePath = filePath;
+            this.aggregator = aggregator;
+        }
+
+        @Override
+        public void run() {
+            try (BufferedReader reader = new BufferedReader(new FileReader(filePath.toFile()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    LogEntry entry = parseLine(line.trim());
+                    if (entry != null) {
+                        aggregator.record(entry);
+                    }
+                }
+            } catch (IOException e) {
+                System.err.println("Error reading file: " + filePath.getFileName() + " -> " + e.getMessage());
+            }
+        }
+
+        private LogEntry parseLine(String line) {
+            if (line == null || line.isEmpty()) return null;
+            String[] parts = line.split("\\s+");
+            if (parts.length != 3) return null;
+            if (!parts[0].matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}")) return null;
+            return new LogEntry(parts[0], parts[1], parts[2]);
+        }
+    }
+
+    static class ReportGenerator {
+        private final ActivityAggregator aggregator;
+        private final String outputPath;
+
+        ReportGenerator(ActivityAggregator aggregator, String outputPath) {
+            this.aggregator = aggregator;
+            this.outputPath = outputPath;
+        }
+
+        void generate() {
+            Map<String, Integer> sortedUsers = aggregator.getUserActivitySnapshot().entrySet().stream()
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (e1, e2) -> e1, LinkedHashMap::new));
+
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(outputPath))) {
+                writer.write("===== USER ACTIVITY REPORT =====");
+                writer.newLine();
+                if (sortedUsers.isEmpty()) {
+                    writer.write("No activity recorded.");
+                    writer.newLine();
+                } else {
+                    for (Map.Entry<String, Integer> entry : sortedUsers.entrySet()) {
+                        writer.write(entry.getKey() + ": " + entry.getValue() + " actions");
+                        writer.newLine();
+                    }
+                }
+                writer.newLine();
+                writer.write("===== ACTION TYPE BREAKDOWN =====");
+                writer.newLine();
+                for (Map.Entry<String, Integer> entry : aggregator.getActionTypeSnapshot().entrySet()) {
+                    writer.write(entry.getKey() + ": " + entry.getValue());
+                    writer.newLine();
+                }
+                writer.newLine();
+                writer.write("Most Active User: " + aggregator.getMostActiveUser());
+                writer.newLine();
+                System.out.println("Report written to: " + outputPath);
+            } catch (IOException e) {
+                System.err.println("Failed to write report: " + e.getMessage());
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        String logDirPath = args.length > 0 ? args[0] : "logs";
+        String reportPath = args.length > 1 ? args[1] : "report.txt";
+
+        Path logDir = Paths.get(logDirPath);
+
+        if (!Files.exists(logDir) || !Files.isDirectory(logDir)) {
+            System.err.println("Invalid or missing log directory: " + logDirPath);
+            return;
+        }
+
+        List<Path> logFiles;
+        try {
+            logFiles = Files.list(logDir)
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.toString().endsWith(".txt"))
+                    .collect(Collectors.toList());
+        } catch (IOException e) {
+            System.err.println("Failed to read log directory: " + e.getMessage());
+            return;
+        }
+
+        if (logFiles.isEmpty()) {
+            System.out.println("No log files found in directory: " + logDirPath);
+            return;
+        }
+
+        ActivityAggregator aggregator = new ActivityAggregator();
+
+        List<Thread> threads = new ArrayList<>();
+        for (Path file : logFiles) {
+            Thread thread = new Thread(new LogProcessor(file, aggregator));
+            threads.add(thread);
+            thread.start();
+        }
+
+        for (Thread thread : threads) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.err.println("Thread interrupted: " + e.getMessage());
+            }
+        }
+
+        new ReportGenerator(aggregator, reportPath).generate();
+    }
+}
